@@ -1,5 +1,18 @@
+# Build outputs
 bin/
 obj/
 .vs/
+
+# Local database files
+hl7_data.db
+hl7_data.db-shm
+hl7_data.db-wal
+
+# Local certificates / secrets
+*.pfx
+*.p12
+
+# User-specific editor files
 *.user
 *.suo
+.DS_Store

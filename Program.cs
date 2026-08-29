@@ -19,6 +19,20 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<HL7Context>();
     db.Database.EnsureCreated();
+
+    // Reiniciar la base de datos al arrancar para que la UI empiece vacía
+    // y no queden registros antiguos de ejecuciones previas.
+    var existingMessages = db.HL7Messages.Include(m => m.TestResults).ToList();
+    foreach (var message in existingMessages)
+    {
+        if (message.TestResults.Count > 0)
+            db.TestResults.RemoveRange(message.TestResults);
+    }
+
+    if (existingMessages.Count > 0)
+        db.HL7Messages.RemoveRange(existingMessages);
+
+    db.SaveChanges();
 }
 
 app.UseSwagger();
@@ -85,29 +99,75 @@ app.MapGet("/api/hl7/patient/{patientId}", async (string patientId, HL7Context d
 
 app.MapGet("/api/hl7/search", async (HL7Context db, string? patientId, string? observationId, string? abnormalOnly) =>
 {
-    var query = db.HL7Messages.AsNoTracking();
-    
-    if (!string.IsNullOrEmpty(patientId))
-        query = query.Where(m => m.PatientId.Contains(patientId));
-    
-    var results = await query.OrderByDescending(m => m.ReceivedAtUtc).ToListAsync();
-    
-    if (!string.IsNullOrEmpty(observationId))
+    var normalizedPatientId = patientId?.Trim();
+    var normalizedObservationId = observationId?.Trim();
+    var abnormalOnlyFlag = abnormalOnly?.Equals("true", StringComparison.OrdinalIgnoreCase) == true;
+
+    if (string.IsNullOrWhiteSpace(normalizedPatientId) &&
+        string.IsNullOrWhiteSpace(normalizedObservationId) &&
+        !abnormalOnlyFlag)
     {
-        var obsId = observationId.ToLower();
-        results = results.Where(m => 
-            m.TestResults.Any(t => t.ObservationIdentifier.ToLower().Contains(obsId))
-        ).ToList();
+        return Results.Ok(new { count = 0, data = Array.Empty<object>() });
     }
-    
-    if (abnormalOnly?.ToLower() == "true")
+
+    var query = db.HL7Messages
+        .AsNoTracking()
+        .Include(m => m.TestResults)
+        .AsQueryable();
+
+    if (!string.IsNullOrEmpty(normalizedPatientId))
+        query = query.Where(m => m.PatientId.Contains(normalizedPatientId));
+
+    var results = await query
+        .OrderByDescending(m => m.ReceivedAtUtc)
+        .ToListAsync();
+
+    var filtered = results
+        .Select(m =>
+        {
+            var testResults = m.TestResults.AsEnumerable();
+
+            if (!string.IsNullOrWhiteSpace(normalizedObservationId))
+            {
+                testResults = testResults.Where(t =>
+                    !string.IsNullOrWhiteSpace(t.ObservationIdentifier) &&
+                    t.ObservationIdentifier.Contains(normalizedObservationId, StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (abnormalOnlyFlag)
+            {
+                testResults = testResults.Where(t =>
+                    !string.IsNullOrWhiteSpace(t.AbnormalFlag) &&
+                    (t.AbnormalFlag == "H" || t.AbnormalFlag == "L"));
+            }
+
+            m.TestResults = testResults.ToList();
+            return m;
+        })
+        .Where(m => m.TestResults.Count > 0)
+        .ToList();
+
+    return Results.Ok(new { count = filtered.Count, data = filtered });
+});
+
+app.MapPost("/api/hl7/reset", async (HL7Context db) =>
+{
+    var allMessages = await db.HL7Messages
+        .Include(m => m.TestResults)
+        .ToListAsync();
+
+    foreach (var message in allMessages)
     {
-        results = results.Where(m =>
-            m.TestResults.Any(t => !string.IsNullOrEmpty(t.AbnormalFlag) && t.AbnormalFlag != "")
-        ).ToList();
+        if (message.TestResults.Count > 0)
+            db.TestResults.RemoveRange(message.TestResults);
     }
-    
-    return Results.Ok(new { count = results.Count, data = results });
+
+    if (allMessages.Count > 0)
+        db.HL7Messages.RemoveRange(allMessages);
+
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new { message = "Stored HL7 data cleared successfully." });
 });
 
 app.MapPost("/api/hl7/receive", async (FrameRequest request, HL7Context db) =>
@@ -117,6 +177,19 @@ app.MapPost("/api/hl7/receive", async (FrameRequest request, HL7Context db) =>
         return Results.BadRequest(new { message = "The 'frame' field is required." });
     }
 
+    var allMessages = await db.HL7Messages
+        .Include(m => m.TestResults)
+        .ToListAsync();
+
+    foreach (var message in allMessages)
+    {
+        if (message.TestResults.Count > 0)
+            db.TestResults.RemoveRange(message.TestResults);
+    }
+
+    if (allMessages.Count > 0)
+        db.HL7Messages.RemoveRange(allMessages);
+
     var type = DetectFrameType(request.Frame);
     var parsed = ParseFrame(request.Frame, type);
     
@@ -125,7 +198,7 @@ app.MapPost("/api/hl7/receive", async (FrameRequest request, HL7Context db) =>
         Id = Guid.NewGuid().ToString("N"),
         Type = type,
         Emitter = request.Emitter,
-        ReceivedAtUtc = DateTime.UtcNow,
+        ReceivedAtUtc = DateTime.Now,
         RawFrame = request.Frame.Trim(),
         MessageType = parsed.messageHeader?.MessageType ?? "",
         SendingApplication = parsed.messageHeader?.SendingApplication ?? "",
@@ -340,7 +413,10 @@ static string GetHtmlUI() => """
                     </select>
                 </div>
             </div>
-            <button onclick="search()">🔍 Buscar</button>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 15px;">
+                <button onclick="search()">🔍 Buscar</button>
+                <button onclick="resetData()" style="background: #d9485f;">🧹 Limpiar datos</button>
+            </div>
         </div>
 
         <div id="message" style="display: none;"></div>
@@ -356,6 +432,12 @@ static string GetHtmlUI() => """
             const messageDiv = document.getElementById('message');
             
             messageDiv.style.display = 'none';
+
+            if (!patientId && !obsId && !abnormal) {
+                resultsDiv.innerHTML = '<div class="loading">Sin resultados para mostrar. Introduce un filtro y pulsa Buscar.</div>';
+                return;
+            }
+
             resultsDiv.innerHTML = '<div class="loading">Cargando...</div>';
 
             try {
@@ -385,7 +467,16 @@ static string GetHtmlUI() => """
                             </div>
                             <div class="info-block">
                                 <div class="info-label">Fecha de Recepción</div>
-                                <div class="info-value">${new Date(msg.receivedAtUtc).toLocaleString('es-ES')}</div>
+                                <div class="info-value">${new Date(msg.receivedAtUtc).toLocaleString('es-ES', {
+                                    day: '2-digit',
+                                    month: '2-digit',
+                                    year: 'numeric',
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                    second: '2-digit',
+                                    hour12: false,
+                                    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone
+                                })}</div>
                             </div>
                             <div class="info-block">
                                 <div class="info-label">Tipo de Mensaje</div>
@@ -433,8 +524,21 @@ static string GetHtmlUI() => """
             }
         }
 
-        // Cargar últimos resultados al iniciar
-        window.addEventListener('load', search);
+        async function resetData() {
+            const response = await fetch('/api/hl7/reset', { method: 'POST' });
+            const data = await response.json();
+
+            document.getElementById('results').innerHTML = '<div class="loading">Datos eliminados. La vista queda vacía.</div>';
+            const message = document.getElementById('message');
+            message.className = 'success';
+            message.textContent = data.message;
+            message.style.display = 'block';
+        }
+
+        // La página empieza vacía por defecto hasta que el usuario busca
+        window.addEventListener('load', () => {
+            document.getElementById('results').innerHTML = '<div class="loading">Sin resultados para mostrar. Introduce un filtro y pulsa Buscar.</div>';
+        });
     </script>
 </body>
 </html>
@@ -489,19 +593,19 @@ public class HL7Message
     public string Emitter { get; set; } = "";
     public DateTime ReceivedAtUtc { get; set; }
     public string RawFrame { get; set; } = "";
-    
+
     // Message Header
     public string MessageType { get; set; } = "";
     public string SendingApplication { get; set; } = "";
     public string ReceivingApplication { get; set; } = "";
     public string MessageControlId { get; set; } = "";
-    
+
     // Patient Info
     public string PatientId { get; set; } = "";
     public string PatientName { get; set; } = "";
     public string DateOfBirth { get; set; } = "";
     public string Sex { get; set; } = "";
-    
+
     // Relación con resultados
     public List<TestResult> TestResults { get; set; } = new();
 }
@@ -517,9 +621,11 @@ public class TestResult
     public string ReferenceRange { get; set; } = "";
     public string AbnormalFlag { get; set; } = "";
     public string ResultStatus { get; set; } = "";
-    
+
     // Foreign key
     public string HL7MessageId { get; set; } = "";
+
+    [JsonIgnore]
     public HL7Message? HL7Message { get; set; }
 }
 
